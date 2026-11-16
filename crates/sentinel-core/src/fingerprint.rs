@@ -80,6 +80,51 @@ impl WifiFrame {
     }
 }
 
+/// Everything we managed to extract from one captured frame or advertisement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "radio", rename_all = "snake_case")]
+pub enum Evidence {
+    Wifi(WifiEvidence),
+    Ble(BleEvidence),
+}
+
+impl Evidence {
+    pub fn radio(&self) -> Radio {
+        match self {
+            Evidence::Wifi(_) => Radio::Wifi,
+            Evidence::Ble(_) => Radio::Ble,
+        }
+    }
+
+    /// A short human-readable description, for display.
+    pub fn describe(&self) -> String {
+        match self {
+            Evidence::Wifi(w) => match w.frame {
+                WifiFrame::Beacon => format!("AP \"{}\"", w.ssid.as_deref().unwrap_or("<hidden>")),
+                WifiFrame::AssociatedClient => "associated client".to_string(),
+                WifiFrame::ProbeRequest => {
+                    if w.directed_ssids.is_empty() {
+                        format!("probe ({} IEs)", w.ie_order.len())
+                    } else {
+                        format!("probe for {}", w.directed_ssids.join(", "))
+                    }
+                }
+            },
+            Evidence::Ble(b) => {
+                if let Some(name) = &b.local_name {
+                    name.clone()
+                } else if let Some(v) = b.vendor_name() {
+                    format!("{v} device")
+                } else if !b.service_uuids.is_empty() {
+                    format!("BLE svc {}", b.service_uuids[0])
+                } else {
+                    "BLE advertiser".to_string()
+                }
+            }
+        }
+    }
+}
+
 /// Fingerprintable attributes of an 802.11 frame.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WifiEvidence {
@@ -145,6 +190,79 @@ impl WifiEvidence {
     }
 }
 
+/// Fingerprintable attributes of a BLE advertisement.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BleEvidence {
+    /// Advertising flags (AD type 0x01).
+    pub flags: Option<u8>,
+    /// AD structure types in transmission order - a firmware trait, same role
+    /// as the Wi-Fi IE ordering.
+    pub ad_order: Vec<u8>,
+    /// Advertised service UUIDs, rendered short-form where possible.
+    pub service_uuids: Vec<String>,
+    /// Company identifier from manufacturer-specific data (AD type 0xff).
+    pub company_id: Option<u16>,
+    /// First bytes of the manufacturer payload. For Apple these are Continuity
+    /// message types, which differ between a phone, a watch and earbuds.
+    pub mfg_prefix: Vec<u8>,
+    /// Length of the manufacturer payload - stable per device role.
+    pub mfg_len: usize,
+    pub local_name: Option<String>,
+    pub tx_power: Option<i8>,
+    /// True when the report was a scan response rather than an advertisement.
+    pub scan_response: bool,
+}
+
+impl BleEvidence {
+    pub fn signature(&self) -> u64 {
+        let mut buf: Vec<u8> = Vec::with_capacity(64);
+        buf.push(self.flags.unwrap_or(0xee));
+        buf.extend_from_slice(&self.ad_order);
+        buf.push(0xff);
+        if let Some(c) = self.company_id {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.mfg_prefix);
+        buf.push(self.mfg_len.min(255) as u8);
+        buf.push(0xff);
+        let mut uuids = self.service_uuids.clone();
+        uuids.sort();
+        uuids.dedup();
+        for u in &uuids {
+            buf.extend_from_slice(u.as_bytes());
+            buf.push(0x00);
+        }
+        // A device that advertises a fixed local name is trivially trackable, so
+        // fold it in; names that embed a rotating value are uncommon.
+        if let Some(n) = &self.local_name {
+            buf.extend_from_slice(n.as_bytes());
+        }
+        fnv1a64(&buf)
+    }
+
+    /// Assigned-number lookup for a handful of vendors common in homes.
+    /// Anything else is reported by its numeric ID.
+    pub fn vendor_name(&self) -> Option<&'static str> {
+        Some(match self.company_id? {
+            0x004c => "Apple",
+            0x0006 => "Microsoft",
+            0x00e0 => "Google",
+            0x0075 => "Samsung",
+            0x0087 => "Garmin",
+            0x0157 => "Huami (Amazfit)",
+            0x038f => "Xiaomi",
+            0x05a7 => "Sonos",
+            0x0171 => "Amazon",
+            0x0499 => "Ruuvi",
+            0x0059 => "Nordic Semiconductor",
+            0x000f => "Broadcom",
+            0x0001 => "Nokia",
+            0x0131 => "Cypress",
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +284,24 @@ mod tests {
         assert_ne!(probe(&["HomeNet"]).signature(), probe(&["OtherNet"]).signature());
         // ...but not with the order they were probed in.
         assert_eq!(probe(&["a", "b"]).signature(), probe(&["b", "a"]).signature());
+    }
+
+    #[test]
+    fn ble_signature_distinguishes_device_roles() {
+        // A phone and a Find My tag from the same vendor differ in payload shape.
+        let phone = BleEvidence {
+            company_id: Some(0x004c),
+            ad_order: vec![0x01, 0xff],
+            mfg_prefix: vec![0x10, 0x05],
+            mfg_len: 12,
+            ..Default::default()
+        };
+        let tag = BleEvidence {
+            mfg_prefix: vec![0x12, 0x19],
+            mfg_len: 27,
+            ..phone.clone()
+        };
+        assert_ne!(phone.signature(), tag.signature());
+        assert_eq!(phone.vendor_name(), Some("Apple"));
     }
 }
