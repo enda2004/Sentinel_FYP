@@ -10,3 +10,4 @@ description = "Domain model and fingerprinting for the passive Wi-Fi/BLE intrude
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+chrono.workspace = true
