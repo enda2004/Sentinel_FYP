@@ -1,0 +1,45 @@
+# Sentinel — passive Wi-Fi / BLE intruder alarm
+#
+# Copy this file to config.toml and edit it.
+
+[wifi]
+enabled = true
+# Monitor-mode interface. The built-in Raspberry Pi radio (wlan0) is usually
+# carrying the Pi's own network connection, so a second adapter is normal.
+interface = "wlan1"
+
+# Channels to hop between. One radio can only listen to one channel at a time,
+# so every channel added dilutes coverage of the others. 1/6/11 carry most
+# 2.4 GHz probe traffic; list only the 5 GHz channels your adapter can tune.
+channels = [1, 6, 11, 36, 44, 48, 165]
+
+# Milliseconds per channel. Probe requests come in bursts, so too short a dwell
+# misses whole bursts; too long a dwell means long blind spots on the others.
+dwell_ms = 350
+hop = true
+
+# Track clients that are already associated to a network. Their addresses stay
+# fixed for as long as they remain joined, which makes them a very reliable
+# identifier for people who use the home Wi-Fi.
+capture_data_frames = true
+
+# Ignore anything weaker than this. Keeps the street and the neighbours out of
+# the dataset - both a noise-reduction measure and a data-minimisation one.
+min_rssi = -80
+# Capture buffer size for libpcap, in bytes.
+buffer_bytes = 4194304
+
+[ble]
+enabled = true
+# HCI device index: 0 means hci0, the Pi's built-in Bluetooth.
+adapter = 0
+# Scan interval and window in 0.625 ms units. Equal values mean the radio
+# listens continuously rather than duty-cycling.
+scan_interval = 96
+scan_window = 96
+# No signal limit for Bluetooth: everything the radio hears is to be kept,
+# and any strength may alert. This relies on BLE not reaching far beyond the
+# property; check that wherever the Pi is placed. Wi-Fi has its own limit
+# ([wifi] min_rssi).
+# Leave off: repeat advertisements are what show dwell time and RSSI trends.
+filter_duplicates = false

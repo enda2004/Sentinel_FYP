@@ -7,11 +7,13 @@
 //! swapped (live radio, pcap replay, synthetic data) without touching it, and
 //! keeps a database driver out of anything that only captures.
 
+pub mod config;
 pub mod fingerprint;
 pub mod mac;
 pub mod observation;
 pub mod oui;
 
+pub use config::Config;
 pub use fingerprint::{BleEvidence, DeviceKey, Evidence, Radio, WifiEvidence, WifiFrame};
 pub use mac::{MacAddr, MacKind};
 pub use observation::Observation;
