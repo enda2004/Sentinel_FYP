@@ -262,6 +262,50 @@ impl BleEvidence {
         score
     }
 
+    /// A *guess* at what kind of device this is, from the manufacturer payload.
+    ///
+    /// **This is inference, not a model number**, and the caller must present it
+    /// as such. Nothing in a BLE advertisement states the product; what we have
+    /// is Apple's Continuity protocol, whose first payload byte is a message
+    /// type that different product classes emit at different rates. A watch
+    /// broadcasts Nearby Info constantly, AirPods announce Proximity Pairing,
+    /// and so on. The mapping below is the widely-documented reading of those
+    /// type bytes, and it is right often enough to be useful and wrong often
+    /// enough that it must never be shown as a bare fact.
+    ///
+    /// Only Apple is attempted. Every other vendor either does not publish a
+    /// comparable structure or varies it per product line, and guessing from
+    /// thin evidence would be worse than saying nothing - so everything else
+    /// returns `None` rather than a speculative label.
+    ///
+    /// Reference: Apple Continuity message types, as documented by the
+    /// furiousMAC protocol analysis (US Naval Postgraduate School).
+    pub fn inferred_model(&self) -> Option<&'static str> {
+        // Apple only. 0x004c is Apple's Bluetooth SIG company identifier.
+        if self.company_id? != 0x004c {
+            return None;
+        }
+        Some(match self.mfg_prefix.first()? {
+            // Proximity Pairing - the earbud/accessory pairing beacon.
+            0x07 => "AirPods or accessory",
+            // Nearby Info. Ubiquitous across iPhone, iPad and Watch; the
+            // second byte carries status flags, not a product code, so this
+            // cannot be narrowed further without overclaiming.
+            0x10 => "iPhone, iPad or Watch",
+            // Nearby Action - AirDrop, setup prompts. Handsets and tablets.
+            0x0f => "iPhone or iPad",
+            // AirPrint.
+            0x03 => "printer",
+            // Handoff between a user's own devices.
+            0x0c => "Mac, iPhone or iPad",
+            // AirPlay target: Apple TV, HomePod.
+            0x09 | 0x0a => "Apple TV or HomePod",
+            // Find My / offline finding beacon - AirTag and anything opted in.
+            0x12 => "AirTag or Find My device",
+            _ => return None,
+        })
+    }
+
     /// Assigned-number lookup for a handful of vendors common in homes.
     /// Anything else is reported by its numeric ID.
     pub fn vendor_name(&self) -> Option<&'static str> {
@@ -447,5 +491,34 @@ mod tests {
         };
         assert_ne!(phone.signature(), tag.signature());
         assert_eq!(phone.vendor_name(), Some("Apple"));
+    }
+
+    #[test]
+    fn model_inference_is_apple_only_and_admits_what_it_does_not_know() {
+        let apple = |prefix: Vec<u8>| BleEvidence {
+            company_id: Some(0x004c),
+            mfg_prefix: prefix,
+            ..Default::default()
+        };
+        assert_eq!(apple(vec![0x07, 0x19]).inferred_model(), Some("AirPods or accessory"));
+        assert_eq!(apple(vec![0x10, 0x05]).inferred_model(), Some("iPhone, iPad or Watch"));
+        assert_eq!(apple(vec![0x12, 0x19]).inferred_model(), Some("AirTag or Find My device"));
+
+        // An Apple payload whose type byte we do not recognise must produce no
+        // label at all rather than a nearest-neighbour guess.
+        assert_eq!(apple(vec![0xdd]).inferred_model(), None);
+        assert_eq!(apple(vec![]).inferred_model(), None);
+
+        // Other vendors are never guessed at, however suggestive the payload.
+        let samsung = BleEvidence {
+            company_id: Some(0x0075),
+            mfg_prefix: vec![0x10, 0x05],
+            ..Default::default()
+        };
+        assert_eq!(samsung.inferred_model(), None);
+        assert_eq!(samsung.vendor_name(), Some("Samsung"));
+
+        // No manufacturer data at all.
+        assert_eq!(BleEvidence::default().inferred_model(), None);
     }
 }
