@@ -10,5 +10,5 @@
 pub mod fingerprint;
 pub mod mac;
 
-pub use fingerprint::{BleEvidence, Evidence, Radio, WifiEvidence, WifiFrame};
+pub use fingerprint::{BleEvidence, DeviceKey, Evidence, Radio, WifiEvidence, WifiFrame};
 pub use mac::{MacAddr, MacKind};

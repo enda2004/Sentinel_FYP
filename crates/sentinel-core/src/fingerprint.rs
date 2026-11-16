@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::mac::MacAddr;
+use crate::mac::{MacAddr, MacKind};
 
 /// FNV-1a. Chosen over a cryptographic hash because signatures must stay
 /// comparable across runs and versions, so the value must be stable and
@@ -188,6 +188,18 @@ impl WifiEvidence {
         }
         fnv1a64(&buf)
     }
+
+    /// Rough measure of how much identifying information the fingerprint holds.
+    /// A probe with no IEs beyond the mandatory ones tells us almost nothing;
+    /// one that names three specific networks tells us a great deal.
+    pub fn entropy_score(&self) -> f64 {
+        let mut score = 0.0;
+        score += (self.ie_order.len() as f64).min(12.0) * 0.4;
+        score += self.vendor_ouis.len() as f64 * 1.5;
+        score += self.directed_ssids.len() as f64 * 3.0;
+        score += if self.caps.is_empty() { 0.0 } else { 2.0 };
+        score
+    }
 }
 
 /// Fingerprintable attributes of a BLE advertisement.
@@ -240,6 +252,16 @@ impl BleEvidence {
         fnv1a64(&buf)
     }
 
+    pub fn entropy_score(&self) -> f64 {
+        let mut score = 0.0;
+        score += (self.ad_order.len() as f64).min(8.0) * 0.6;
+        score += self.service_uuids.len() as f64 * 1.5;
+        score += if self.company_id.is_some() { 1.5 } else { 0.0 };
+        score += (self.mfg_prefix.len() as f64).min(4.0);
+        score += if self.local_name.is_some() { 3.0 } else { 0.0 };
+        score
+    }
+
     /// Assigned-number lookup for a handful of vendors common in homes.
     /// Anything else is reported by its numeric ID.
     pub fn vendor_name(&self) -> Option<&'static str> {
@@ -263,6 +285,83 @@ impl BleEvidence {
     }
 }
 
+/// The identity a device is filed under.
+///
+/// This is the crux of the system: when the address is trustworthy we key on
+/// it, and when it is not we fall back to the payload fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceKey {
+    /// Keyed on a hardware address that does not rotate.
+    Address(Radio, MacAddr),
+    /// Keyed on a payload fingerprint because the address rotates.
+    Signature(Radio, u64),
+}
+
+impl DeviceKey {
+    pub fn radio(&self) -> Radio {
+        match self {
+            DeviceKey::Address(r, _) | DeviceKey::Signature(r, _) => *r,
+        }
+    }
+
+    /// Stable string form, used wherever an identity is stored or shown.
+    pub fn as_string(&self) -> String {
+        match self {
+            DeviceKey::Address(r, m) => format!("{}:mac:{}", r.as_str(), m),
+            DeviceKey::Signature(r, s) => format!("{}:sig:{:016x}", r.as_str(), s),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<DeviceKey> {
+        let mut parts = s.splitn(3, ':');
+        let radio: Radio = parts.next()?.parse().ok()?;
+        match parts.next()? {
+            "mac" => Some(DeviceKey::Address(radio, parts.next()?.parse().ok()?)),
+            "sig" => Some(DeviceKey::Signature(
+                radio,
+                u64::from_str_radix(parts.next()?, 16).ok()?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether this identity is anchored to hardware or only to a fingerprint.
+    pub fn is_address_bound(&self) -> bool {
+        matches!(self, DeviceKey::Address(..))
+    }
+}
+
+impl std::fmt::Display for DeviceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_string())
+    }
+}
+
+/// Minimum entropy for a fingerprint to stand in for an address.
+///
+/// A fingerprint is only allowed to stand in for an address when it carries
+/// enough entropy to be worth anything; below the threshold the device is keyed
+/// on its (rotating) address and will simply churn, which is the honest
+/// outcome - a bare probe request from a randomised MAC genuinely is untrackable.
+pub const MIN_SIGNATURE_ENTROPY: f64 = 4.0;
+
+/// Decide how to file an observation.
+pub fn derive_key(mac: &MacAddr, kind: MacKind, evidence: &Evidence) -> DeviceKey {
+    let radio = evidence.radio();
+    if kind.is_stable_identifier() {
+        return DeviceKey::Address(radio, *mac);
+    }
+    let (sig, entropy) = match evidence {
+        Evidence::Wifi(w) => (w.signature(), w.entropy_score()),
+        Evidence::Ble(b) => (b.signature(), b.entropy_score()),
+    };
+    if entropy >= MIN_SIGNATURE_ENTROPY {
+        DeviceKey::Signature(radio, sig)
+    } else {
+        DeviceKey::Address(radio, *mac)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,10 +379,55 @@ mod tests {
     }
 
     #[test]
+    fn signature_survives_address_rotation() {
+        // Same device, two different randomised addresses, identical payload.
+        let a = probe(&["HomeNet"]);
+        let b = probe(&["HomeNet"]);
+        assert_eq!(a.signature(), b.signature());
+
+        let mac1: MacAddr = "b2:11:11:11:11:11".parse().unwrap();
+        let mac2: MacAddr = "be:22:22:22:22:22".parse().unwrap();
+        let k1 = derive_key(&mac1, MacKind::RandomWifi, &Evidence::Wifi(a));
+        let k2 = derive_key(&mac2, MacKind::RandomWifi, &Evidence::Wifi(b));
+        assert_eq!(k1, k2, "randomised addresses must collapse onto one identity");
+        assert!(!k1.is_address_bound());
+    }
+
+    #[test]
     fn signature_changes_with_preferred_networks() {
         assert_ne!(probe(&["HomeNet"]).signature(), probe(&["OtherNet"]).signature());
         // ...but not with the order they were probed in.
         assert_eq!(probe(&["a", "b"]).signature(), probe(&["b", "a"]).signature());
+    }
+
+    #[test]
+    fn universal_addresses_key_on_hardware() {
+        let mac: MacAddr = "b8:27:eb:01:02:03".parse().unwrap();
+        let k = derive_key(&mac, MacKind::Universal, &Evidence::Wifi(probe(&[])));
+        assert_eq!(k, DeviceKey::Address(Radio::Wifi, mac));
+        assert!(k.is_address_bound());
+    }
+
+    #[test]
+    fn low_entropy_probes_are_not_promoted_to_signatures() {
+        let bare = WifiEvidence {
+            frame: WifiFrame::ProbeRequest,
+            ie_order: vec![0, 1],
+            ..Default::default()
+        };
+        let mac: MacAddr = "b2:11:11:11:11:11".parse().unwrap();
+        let k = derive_key(&mac, MacKind::RandomWifi, &Evidence::Wifi(bare));
+        assert!(k.is_address_bound(), "not enough entropy to track across rotations");
+    }
+
+    #[test]
+    fn device_key_round_trips() {
+        for k in [
+            DeviceKey::Address(Radio::Ble, "aa:bb:cc:dd:ee:ff".parse().unwrap()),
+            DeviceKey::Signature(Radio::Wifi, 0xdead_beef_0000_0001),
+        ] {
+            assert_eq!(DeviceKey::parse(&k.as_string()), Some(k));
+        }
     }
 
     #[test]
