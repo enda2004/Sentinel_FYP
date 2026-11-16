@@ -9,4 +9,4 @@
 
 pub mod mac;
 
-pub use mac::MacAddr;
+pub use mac::{MacAddr, MacKind};

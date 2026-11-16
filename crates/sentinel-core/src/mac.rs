@@ -109,6 +109,69 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
+/// How much identity an address actually carries.
+///
+/// `Universal` addresses are burned in and uniquely identify hardware forever.
+/// Everything else rotates on a timer and is only useful when combined with a
+/// payload fingerprint (see [`crate::fingerprint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacKind {
+    /// Globally unique, assigned by the vendor. Strong identifier.
+    Universal,
+    /// 802.11 locally administered address - a randomised Wi-Fi MAC.
+    RandomWifi,
+    /// BLE static random address: random but stable until the device reboots.
+    BleStaticRandom,
+    /// BLE resolvable private address: rotates every ~15 minutes.
+    BleResolvablePrivate,
+    /// BLE non-resolvable private address: rotates and cannot be resolved at all.
+    BleNonResolvable,
+}
+
+impl MacKind {
+    /// Classify an 802.11 address.
+    pub fn classify_wifi(mac: &MacAddr) -> MacKind {
+        if mac.is_locally_administered() {
+            MacKind::RandomWifi
+        } else {
+            MacKind::Universal
+        }
+    }
+
+    /// Classify a Bluetooth device address.
+    ///
+    /// `addr_type` is the value from the HCI advertising report: 0 = public,
+    /// 1 = random. For random addresses the top two bits of the most significant
+    /// octet encode the sub-type (Core Spec Vol 6, Part B, 1.3.2).
+    pub fn classify_ble(mac: &MacAddr, addr_type: u8) -> MacKind {
+        if addr_type == 0 {
+            return MacKind::Universal;
+        }
+        match mac.0[0] >> 6 {
+            0b11 => MacKind::BleStaticRandom,
+            0b01 => MacKind::BleResolvablePrivate,
+            0b00 => MacKind::BleNonResolvable,
+            _ => MacKind::BleNonResolvable,
+        }
+    }
+
+    /// True when the address alone is a dependable long-term identifier.
+    pub fn is_stable_identifier(&self) -> bool {
+        matches!(self, MacKind::Universal | MacKind::BleStaticRandom)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MacKind::Universal => "universal",
+            MacKind::RandomWifi => "random_wifi",
+            MacKind::BleStaticRandom => "ble_static_random",
+            MacKind::BleResolvablePrivate => "ble_rpa",
+            MacKind::BleNonResolvable => "ble_nrpa",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +191,19 @@ mod tests {
         let burned: MacAddr = "b8:27:eb:00:00:01".parse().unwrap();
         assert!(random.is_locally_administered());
         assert!(!burned.is_locally_administered());
+        assert_eq!(MacKind::classify_wifi(&random), MacKind::RandomWifi);
+        assert_eq!(MacKind::classify_wifi(&burned), MacKind::Universal);
+    }
+
+    #[test]
+    fn classifies_ble_address_subtypes() {
+        let rpa: MacAddr = "40:11:22:33:44:55".parse().unwrap(); // 0b01......
+        let static_random: MacAddr = "c0:11:22:33:44:55".parse().unwrap(); // 0b11......
+        let nrpa: MacAddr = "10:11:22:33:44:55".parse().unwrap(); // 0b00......
+        assert_eq!(MacKind::classify_ble(&rpa, 1), MacKind::BleResolvablePrivate);
+        assert_eq!(MacKind::classify_ble(&static_random, 1), MacKind::BleStaticRandom);
+        assert_eq!(MacKind::classify_ble(&nrpa, 1), MacKind::BleNonResolvable);
+        assert_eq!(MacKind::classify_ble(&rpa, 0), MacKind::Universal);
     }
 
     /// `from_slice` takes buffers whose length came off the wire. A short
