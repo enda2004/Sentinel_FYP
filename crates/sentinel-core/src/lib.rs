@@ -6,3 +6,7 @@
 //! fingerprinting unit-testable on any machine, lets the capture layer be
 //! swapped (live radio, pcap replay, synthetic data) without touching it, and
 //! keeps a database driver out of anything that only captures.
+
+pub mod mac;
+
+pub use mac::MacAddr;
