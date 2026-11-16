@@ -1,0 +1,7 @@
+[package]
+name = "sentinel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Domain model and fingerprinting for the passive Wi-Fi/BLE intruder alarm"
