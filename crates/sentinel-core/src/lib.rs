@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod fingerprint;
+pub mod ingest;
 pub mod mac;
 pub mod observation;
 pub mod oui;
