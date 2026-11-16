@@ -7,5 +7,6 @@ license.workspace = true
 description = "Domain model and fingerprinting for the passive Wi-Fi/BLE intruder alarm"
 
 [dependencies]
+anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

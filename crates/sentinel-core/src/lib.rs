@@ -7,6 +7,8 @@
 //! swapped (live radio, pcap replay, synthetic data) without touching it, and
 //! keeps a database driver out of anything that only captures.
 
+pub mod fingerprint;
 pub mod mac;
 
+pub use fingerprint::{Radio, WifiEvidence, WifiFrame};
 pub use mac::{MacAddr, MacKind};
