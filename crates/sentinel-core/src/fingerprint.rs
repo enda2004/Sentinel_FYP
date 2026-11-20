@@ -214,8 +214,9 @@ pub struct BleEvidence {
     pub service_uuids: Vec<String>,
     /// Company identifier from manufacturer-specific data (AD type 0xff).
     pub company_id: Option<u16>,
-    /// First bytes of the manufacturer payload. For Apple these are Continuity
-    /// message types, which differ between a phone, a watch and earbuds.
+    /// First bytes of the manufacturer payload. For Apple, the Continuity
+    /// message type and its length, which differ between a phone, a watch and
+    /// earbuds.
     pub mfg_prefix: Vec<u8>,
     /// Length of the manufacturer payload - stable per device role.
     pub mfg_len: usize,
@@ -279,7 +280,7 @@ impl BleEvidence {
     /// returns `None` rather than a speculative label.
     ///
     /// Reference: Apple Continuity message types, as documented by the
-    /// furiousMAC protocol analysis (US Naval Postgraduate School).
+    /// furiousMAC protocol analysis (US Naval Academy).
     pub fn inferred_model(&self) -> Option<&'static str> {
         // Apple only. 0x004c is Apple's Bluetooth SIG company identifier.
         if self.company_id? != 0x004c {
@@ -289,8 +290,9 @@ impl BleEvidence {
             // Proximity Pairing - the earbud/accessory pairing beacon.
             0x07 => "AirPods or accessory",
             // Nearby Info. Ubiquitous across iPhone, iPad and Watch; the
-            // second byte carries status flags, not a product code, so this
-            // cannot be narrowed further without overclaiming.
+            // second byte is the message length, and the status flags that
+            // follow are not a product code, so this cannot be narrowed
+            // further without overclaiming.
             0x10 => "iPhone, iPad or Watch",
             // Nearby Action - AirDrop, setup prompts. Handsets and tablets.
             0x0f => "iPhone or iPad",
@@ -298,8 +300,11 @@ impl BleEvidence {
             0x03 => "printer",
             // Handoff between a user's own devices.
             0x0c => "Mac, iPhone or iPad",
-            // AirPlay target: Apple TV, HomePod.
-            0x09 | 0x0a => "Apple TV or HomePod",
+            // AirPlay Target: a device offering to play media - Apple TV,
+            // HomePod. (0x0a, AirPlay Source, comes from whichever device is
+            // choosing where to play, and its purpose is undocumented, so it
+            // gets no guess.)
+            0x09 => "Apple TV or HomePod",
             // Find My / offline finding beacon - AirTag and anything opted in.
             0x12 => "AirTag or Find My device",
             _ => return None,
@@ -503,6 +508,11 @@ mod tests {
         assert_eq!(apple(vec![0x07, 0x19]).inferred_model(), Some("AirPods or accessory"));
         assert_eq!(apple(vec![0x10, 0x05]).inferred_model(), Some("iPhone, iPad or Watch"));
         assert_eq!(apple(vec![0x12, 0x19]).inferred_model(), Some("AirTag or Find My device"));
+        assert_eq!(apple(vec![0x09, 0x06]).inferred_model(), Some("Apple TV or HomePod"));
+
+        // AirPlay Source is sent by the device choosing where to play media,
+        // not by an AirPlay target, so it must not be labelled as one.
+        assert_eq!(apple(vec![0x0a, 0x00]).inferred_model(), None);
 
         // An Apple payload whose type byte we do not recognise must produce no
         // label at all rather than a nearest-neighbour guess.
