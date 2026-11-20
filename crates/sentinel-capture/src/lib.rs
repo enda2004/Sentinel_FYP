@@ -10,6 +10,7 @@
 //! * [`wifi`] - libpcap on a monitor-mode interface, with channel hopping
 
 pub mod dot11;
+pub mod hci;
 pub mod radiotap;
 pub mod wifi;
 
