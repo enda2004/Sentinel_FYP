@@ -4,4 +4,5 @@
 //! they rely on work on byte slices alone, so they can be tested without a
 //! radio.
 
+pub mod dot11;
 pub mod radiotap;
