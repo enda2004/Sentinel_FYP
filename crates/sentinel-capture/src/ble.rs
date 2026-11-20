@@ -1,0 +1,378 @@
+//! Bluetooth LE advertisements, decoded from HCI advertising reports.
+//!
+//! Bluetooth LE reaches people who never join the Wi-Fi: phones, watches and
+//! earbuds advertise continuously whether or not they are paired with
+//! anything nearby. Modern devices use resolvable private addresses that
+//! rotate every fifteen minutes or so, which is why the advertisement
+//! *payload* rather than the address carries the identity.
+
+use sentinel_core::fingerprint::BleEvidence;
+use sentinel_core::mac::MacAddr;
+
+use crate::hci::{
+    EVT_LE_META, HCI_EVENT_PKT, SUBEVT_LE_ADVERTISING_REPORT, SUBEVT_LE_EXT_ADVERTISING_REPORT,
+};
+
+/// One decoded advertising report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvReport {
+    pub address: MacAddr,
+    pub address_type: u8,
+    pub rssi: Option<i8>,
+    pub evidence: BleEvidence,
+}
+
+/// Decode an HCI event packet into zero or more advertising reports.
+pub fn parse_event(pkt: &[u8]) -> Vec<AdvReport> {
+    // [packet type][event code][parameter length][parameters...]
+    if pkt.len() < 4 || pkt[0] != HCI_EVENT_PKT || pkt[1] != EVT_LE_META {
+        return Vec::new();
+    }
+    let plen = pkt[2] as usize;
+    let Some(params) = pkt.get(3..3 + plen) else {
+        return Vec::new();
+    };
+    if params.is_empty() {
+        return Vec::new();
+    }
+    match params[0] {
+        SUBEVT_LE_ADVERTISING_REPORT => parse_legacy_reports(&params[1..]),
+        SUBEVT_LE_EXT_ADVERTISING_REPORT => parse_extended_reports(&params[1..]),
+        _ => Vec::new(),
+    }
+}
+
+/// LE Advertising Report (Core Spec Vol 4, Part E, 7.7.65.2).
+///
+/// The specification describes the parameters as parallel arrays. This reads
+/// each report's fields consecutively instead, as BlueZ does; the two layouts
+/// are the same for an event holding a single report.
+fn parse_legacy_reports(mut body: &[u8]) -> Vec<AdvReport> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let num = body[0] as usize;
+    body = &body[1..];
+    let mut out = Vec::with_capacity(num);
+
+    for _ in 0..num {
+        if body.len() < 9 {
+            break;
+        }
+        let event_type = body[0];
+        let address_type = body[1];
+        let Some(address) = MacAddr::from_slice(&body[2..8]) else {
+            break;
+        };
+        let data_len = body[8] as usize;
+        if body.len() < 9 + data_len + 1 {
+            break;
+        }
+        let data = &body[9..9 + data_len];
+        let rssi = body[9 + data_len] as i8;
+
+        let mut evidence = parse_ad_structures(data);
+        // 0x04 = SCAN_RSP: a reply to somebody else's active scan. Worth
+        // recording (it often carries the device name) but flagged, because its
+        // payload differs from the device's own advertisement.
+        evidence.scan_response = event_type == 0x04;
+
+        out.push(AdvReport {
+            address,
+            address_type,
+            // 127 is the "RSSI not available" sentinel.
+            rssi: if rssi == 127 { None } else { Some(rssi) },
+            evidence,
+        });
+        body = &body[9 + data_len + 1..];
+    }
+    out
+}
+
+/// LE Extended Advertising Report (Core Spec Vol 4, Part E, 7.7.65.13),
+/// emitted by 5.0 controllers when extended scanning is in use.
+fn parse_extended_reports(mut body: &[u8]) -> Vec<AdvReport> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let num = body[0] as usize;
+    body = &body[1..];
+    let mut out = Vec::with_capacity(num);
+
+    const HEADER: usize = 24;
+    for _ in 0..num {
+        if body.len() < HEADER {
+            break;
+        }
+        let event_type = u16::from_le_bytes([body[0], body[1]]);
+        let address_type = body[2];
+        let Some(address) = MacAddr::from_slice(&body[3..9]) else {
+            break;
+        };
+        // Event_Type(2) Address_Type(1) Address(6) Primary_PHY(1) Secondary_PHY(1)
+        // Advertising_SID(1) TX_Power(1) RSSI(1) ...
+        let tx_power = body[12] as i8;
+        let rssi = body[13] as i8;
+        let data_len = body[23] as usize;
+        if body.len() < HEADER + data_len {
+            break;
+        }
+        let data = &body[HEADER..HEADER + data_len];
+
+        let mut evidence = parse_ad_structures(data);
+        evidence.scan_response = event_type & 0x0008 != 0;
+        if evidence.tx_power.is_none() && tx_power != 127 {
+            evidence.tx_power = Some(tx_power);
+        }
+
+        out.push(AdvReport {
+            address,
+            address_type,
+            rssi: if rssi == 127 { None } else { Some(rssi) },
+            evidence,
+        });
+        body = &body[HEADER + data_len..];
+    }
+    out
+}
+
+// AD types, from the Bluetooth assigned numbers.
+const AD_FLAGS: u8 = 0x01;
+const AD_UUID16_PARTIAL: u8 = 0x02;
+const AD_UUID16_COMPLETE: u8 = 0x03;
+const AD_UUID32_PARTIAL: u8 = 0x04;
+const AD_UUID32_COMPLETE: u8 = 0x05;
+const AD_UUID128_PARTIAL: u8 = 0x06;
+const AD_UUID128_COMPLETE: u8 = 0x07;
+const AD_NAME_SHORT: u8 = 0x08;
+const AD_NAME_COMPLETE: u8 = 0x09;
+const AD_TX_POWER: u8 = 0x0a;
+const AD_SERVICE_DATA_16: u8 = 0x16;
+const AD_MANUFACTURER: u8 = 0xff;
+
+/// Walk the AD structures in an advertising payload.
+pub fn parse_ad_structures(data: &[u8]) -> BleEvidence {
+    let mut ev = BleEvidence::default();
+    let mut i = 0usize;
+
+    while i < data.len() {
+        let len = data[i] as usize;
+        // A zero length is the padding that marks the end of the payload.
+        if len == 0 {
+            break;
+        }
+        if i + 1 + len > data.len() {
+            break; // truncated structure
+        }
+        let ad_type = data[i + 1];
+        let payload = &data[i + 2..i + 1 + len];
+        ev.ad_order.push(ad_type);
+
+        match ad_type {
+            AD_FLAGS => ev.flags = payload.first().copied(),
+            AD_UUID16_PARTIAL | AD_UUID16_COMPLETE => {
+                for c in payload.chunks_exact(2) {
+                    ev.service_uuids
+                        .push(format!("{:04x}", u16::from_le_bytes([c[0], c[1]])));
+                }
+            }
+            AD_UUID32_PARTIAL | AD_UUID32_COMPLETE => {
+                for c in payload.chunks_exact(4) {
+                    ev.service_uuids.push(format!(
+                        "{:08x}",
+                        u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    ));
+                }
+            }
+            AD_UUID128_PARTIAL | AD_UUID128_COMPLETE => {
+                for c in payload.chunks_exact(16) {
+                    ev.service_uuids.push(format_uuid128(c));
+                }
+            }
+            AD_NAME_SHORT | AD_NAME_COMPLETE => {
+                let name = String::from_utf8_lossy(payload).trim().to_string();
+                if !name.is_empty() {
+                    ev.local_name = Some(name);
+                }
+            }
+            AD_TX_POWER => ev.tx_power = payload.first().map(|b| *b as i8),
+            AD_SERVICE_DATA_16 => {
+                if payload.len() >= 2 {
+                    ev.service_uuids.push(format!(
+                        "{:04x}",
+                        u16::from_le_bytes([payload[0], payload[1]])
+                    ));
+                }
+            }
+            AD_MANUFACTURER => {
+                if payload.len() >= 2 {
+                    ev.company_id = Some(u16::from_le_bytes([payload[0], payload[1]]));
+                    // Only the leading bytes are kept. For Apple these are the
+                    // Continuity message type and length, which distinguish a
+                    // phone from a watch from earbuds; the remainder is a
+                    // rotating token and would poison the fingerprint.
+                    let rest = &payload[2..];
+                    ev.mfg_prefix = rest[..rest.len().min(2)].to_vec();
+                    ev.mfg_len = rest.len();
+                }
+            }
+            _ => {}
+        }
+        i += 1 + len;
+    }
+    ev
+}
+
+fn format_uuid128(b: &[u8]) -> String {
+    // 128-bit UUIDs are transmitted little-endian.
+    let mut r = b.to_vec();
+    r.reverse();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_core::mac::MacKind;
+
+    fn ad(t: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![(payload.len() + 1) as u8, t];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Wrap advertising data in a complete HCI LE Advertising Report event.
+    fn event(addr_type: u8, addr: [u8; 6], data: &[u8], rssi: i8) -> Vec<u8> {
+        let mut params = vec![SUBEVT_LE_ADVERTISING_REPORT, 0x01, 0x00, addr_type];
+        params.extend_from_slice(&addr);
+        params.push(data.len() as u8);
+        params.extend_from_slice(data);
+        params.push(rssi as u8);
+
+        let mut pkt = vec![HCI_EVENT_PKT, EVT_LE_META, params.len() as u8];
+        pkt.extend_from_slice(&params);
+        pkt
+    }
+
+    #[test]
+    fn decodes_a_typical_apple_advertisement() {
+        let mut data = ad(AD_FLAGS, &[0x1a]);
+        data.extend(ad(AD_MANUFACTURER, &[0x4c, 0x00, 0x10, 0x05, 0x1b, 0x11, 0x22, 0x33]));
+
+        let reports = parse_event(&event(1, [0x40, 1, 2, 3, 4, 5], &data, -55));
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert_eq!(r.address.to_string(), "40:01:02:03:04:05");
+        assert_eq!(r.rssi, Some(-55));
+        assert_eq!(r.evidence.company_id, Some(0x004c));
+        assert_eq!(r.evidence.vendor_name(), Some("Apple"));
+        assert_eq!(r.evidence.mfg_prefix, vec![0x10, 0x05]);
+        assert_eq!(r.evidence.ad_order, vec![AD_FLAGS, AD_MANUFACTURER]);
+        assert_eq!(r.evidence.flags, Some(0x1a));
+
+        // A resolvable private address must be classified as such.
+        assert_eq!(
+            MacKind::classify_ble(&r.address, r.address_type),
+            MacKind::BleResolvablePrivate
+        );
+    }
+
+    #[test]
+    fn rotating_payload_tail_does_not_change_the_signature() {
+        // Same device, two Continuity broadcasts whose trailing token differs.
+        let mut a = ad(AD_FLAGS, &[0x1a]);
+        a.extend(ad(AD_MANUFACTURER, &[0x4c, 0x00, 0x10, 0x05, 0xaa, 0xbb, 0xcc, 0xdd]));
+        let mut b = ad(AD_FLAGS, &[0x1a]);
+        b.extend(ad(AD_MANUFACTURER, &[0x4c, 0x00, 0x10, 0x05, 0x11, 0x22, 0x33, 0x44]));
+
+        let sa = parse_ad_structures(&a).signature();
+        let sb = parse_ad_structures(&b).signature();
+        assert_eq!(sa, sb, "only the stable prefix should feed the fingerprint");
+    }
+
+    #[test]
+    fn different_device_roles_get_different_signatures() {
+        let mut phone = ad(AD_FLAGS, &[0x1a]);
+        phone.extend(ad(AD_MANUFACTURER, &[0x4c, 0x00, 0x10, 0x05, 0x00]));
+        let mut earbuds = ad(AD_FLAGS, &[0x1a]);
+        earbuds.extend(ad(AD_MANUFACTURER, &[0x4c, 0x00, 0x07, 0x19, 0x00, 0x01, 0x02]));
+        assert_ne!(
+            parse_ad_structures(&phone).signature(),
+            parse_ad_structures(&earbuds).signature()
+        );
+    }
+
+    #[test]
+    fn decodes_names_uuids_and_tx_power() {
+        let mut data = ad(AD_NAME_COMPLETE, b"Sam's Watch");
+        data.extend(ad(AD_UUID16_COMPLETE, &[0x0d, 0x18, 0x0f, 0x18])); // 180d, 180f
+        data.extend(ad(AD_TX_POWER, &[(-12i8) as u8]));
+
+        let ev = parse_ad_structures(&data);
+        assert_eq!(ev.local_name.as_deref(), Some("Sam's Watch"));
+        assert_eq!(ev.service_uuids, vec!["180d".to_string(), "180f".to_string()]);
+        assert_eq!(ev.tx_power, Some(-12));
+    }
+
+    #[test]
+    fn decodes_128_bit_uuids_in_wire_order() {
+        let mut le = (0..16u8).collect::<Vec<u8>>();
+        le.reverse(); // transmitted little-endian
+        let ev = parse_ad_structures(&ad(AD_UUID128_COMPLETE, &le));
+        assert_eq!(ev.service_uuids, vec!["00010203-0405-0607-0809-0a0b0c0d0e0f"]);
+    }
+
+    #[test]
+    fn malformed_payloads_are_survivable() {
+        // Length field overruns the buffer.
+        assert!(parse_ad_structures(&[0x20, 0xff, 0x01]).ad_order.is_empty());
+        // Zero-length terminator.
+        assert!(parse_ad_structures(&[0x00, 0x00, 0x00]).ad_order.is_empty());
+        // Truncated events.
+        assert!(parse_event(&[]).is_empty());
+        assert!(parse_event(&[HCI_EVENT_PKT, EVT_LE_META, 40, 0x02]).is_empty());
+        // Wrong event code.
+        assert!(parse_event(&[HCI_EVENT_PKT, 0x0e, 1, 0]).is_empty());
+    }
+
+    #[test]
+    fn rssi_sentinel_is_reported_as_unknown() {
+        let reports = parse_event(&event(0, [1, 2, 3, 4, 5, 6], &ad(AD_FLAGS, &[0x06]), 127));
+        assert_eq!(reports[0].rssi, None);
+    }
+
+    #[test]
+    fn decodes_extended_reports_from_bluetooth_5_controllers() {
+        let data = ad(AD_MANUFACTURER, &[0x75, 0x00, 0x42, 0x43]);
+        let mut params = vec![SUBEVT_LE_EXT_ADVERTISING_REPORT, 0x01];
+        // Event type bits: 0 connectable, 1 scannable, 3 scan response, 4 legacy.
+        params.extend_from_slice(&0x001bu16.to_le_bytes());
+        params.push(0x01); // address type: random
+        params.extend_from_slice(&[0xc0, 1, 2, 3, 4, 5]); // static random address
+        params.extend_from_slice(&[0x01, 0x00, 0x00]); // primary/secondary phy, sid
+        params.push((-20i8) as u8); // tx power
+        params.push((-60i8) as u8); // rssi
+        params.extend_from_slice(&[0x00, 0x00]); // periodic interval
+        params.push(0x00); // direct address type
+        params.extend_from_slice(&[0u8; 6]); // direct address
+        params.push(data.len() as u8);
+        params.extend_from_slice(&data);
+
+        let mut pkt = vec![HCI_EVENT_PKT, EVT_LE_META, params.len() as u8];
+        pkt.extend_from_slice(&params);
+
+        let reports = parse_event(&pkt);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].rssi, Some(-60));
+        assert_eq!(reports[0].evidence.company_id, Some(0x0075));
+        assert_eq!(reports[0].evidence.tx_power, Some(-20));
+        assert!(reports[0].evidence.scan_response);
+        assert_eq!(
+            MacKind::classify_ble(&reports[0].address, reports[0].address_type),
+            MacKind::BleStaticRandom
+        );
+    }
+}
