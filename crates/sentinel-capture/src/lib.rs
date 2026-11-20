@@ -10,9 +10,12 @@
 //! * [`wifi`] - libpcap on a monitor-mode interface, with channel hopping
 //! * [`ble`] - raw HCI passive scanning
 //! * [`replay`] - pcap files and a synthetic household, for development
+//! * [`forward`] - ships observations to the engine over TCP, reconnecting
+//!   and counting what it has to drop
 
 pub mod ble;
 pub mod dot11;
+pub mod forward;
 pub mod hci;
 pub mod radiotap;
 pub mod replay;

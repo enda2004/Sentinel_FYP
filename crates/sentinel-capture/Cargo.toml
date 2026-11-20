@@ -11,6 +11,6 @@ sentinel-core = { path = "../sentinel-core" }
 anyhow.workspace = true
 chrono.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
 libc.workspace = true
 pcap = "2"
