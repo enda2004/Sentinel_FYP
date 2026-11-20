@@ -9,11 +9,13 @@
 //!
 //! * [`wifi`] - libpcap on a monitor-mode interface, with channel hopping
 //! * [`ble`] - raw HCI passive scanning
+//! * [`replay`] - pcap files, for development
 
 pub mod ble;
 pub mod dot11;
 pub mod hci;
 pub mod radiotap;
+pub mod replay;
 pub mod wifi;
 
 pub use ble::BleStats;
