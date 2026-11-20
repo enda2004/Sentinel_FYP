@@ -1,7 +1,15 @@
-//! Live 802.11 capture from a monitor-mode interface, read with libpcap.
+//! Live 802.11 capture from a monitor-mode interface.
+//!
+//! libpcap does the reading; a companion thread retunes the adapter so the
+//! single radio can cover several channels. Hopping is a real trade-off: with
+//! one adapter, time spent on channel 36 is time not spent on channel 6, so
+//! with N channels each one is heard about 1/N of the time a dedicated radio
+//! would hear it. Probe requests are retransmitted across channels, which is
+//! what makes the compromise workable at all.
 
 use std::collections::HashSet;
 use std::os::unix::io::AsRawFd;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -30,6 +38,7 @@ pub struct WifiStats {
     pub too_weak: AtomicU64,
     /// Frames discarded because they came from this host's own radios.
     pub self_frames: AtomicU64,
+    pub current_channel: AtomicU64,
 }
 
 /// Start capturing. Blocks until `shutdown` is set, so call it on a dedicated
@@ -90,9 +99,23 @@ pub fn run(
         .setnonblock()
         .context("switching the capture to non-blocking mode")?;
 
+    // Stops the hopper on its own, independently of the shared shutdown flag.
+    let hop_stop = Arc::new(AtomicBool::new(false));
+    let hopper = if cfg.hop {
+        Some(spawn_hopper(
+            cfg.clone(),
+            shutdown.clone(),
+            hop_stop.clone(),
+            stats.clone(),
+        ))
+    } else {
+        None
+    };
+
     let local = local_addresses();
     info!(
         interface = %cfg.interface,
+        channels = ?cfg.channels,
         ignoring_own_addresses = local.len(),
         "802.11 capture running"
     );
@@ -120,7 +143,7 @@ pub fn run(
                                 debug!("observation channel full; dropping a Wi-Fi sighting")
                             }
                             Err(TrySendError::Closed(_)) => {
-                                return finish("observation receiver closed")
+                                return finish(&hop_stop, hopper, "observation receiver closed")
                             }
                         }
                     }
@@ -130,11 +153,13 @@ pub fn run(
                     read_errors = 0;
                     break;
                 }
-                Err(pcap::Error::NoMorePackets) => return finish("no more packets"),
+                Err(pcap::Error::NoMorePackets) => {
+                    return finish(&hop_stop, hopper, "no more packets")
+                }
                 Err(e) => {
                     read_errors += 1;
                     if read_errors >= MAX_READ_ERRORS {
-                        finish("the adapter keeps failing")?;
+                        finish(&hop_stop, hopper, "the adapter keeps failing")?;
                         return Err(e).with_context(|| format!("reading from {}", cfg.interface));
                     }
                     warn!("pcap read error: {e}");
@@ -145,10 +170,23 @@ pub fn run(
         }
     }
 
-    finish("shutdown requested")
+    finish(&hop_stop, hopper, "shutdown requested")
 }
 
-fn finish(reason: &str) -> Result<()> {
+fn finish(
+    hop_stop: &Arc<AtomicBool>,
+    hopper: Option<thread::JoinHandle<()>>,
+    reason: &str,
+) -> Result<()> {
+    // The hopper loops until it is told to stop. When capture ends by itself
+    // (the adapter fails, or nothing receives observations any more) the
+    // shared `shutdown` flag is still clear, so the hopper has a flag of its
+    // own. Only that one is set: `shutdown` may be shared with other capture,
+    // which must keep running when Wi-Fi stops.
+    hop_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = hopper {
+        let _ = h.join();
+    }
     info!(reason, "802.11 capture stopped");
     Ok(())
 }
@@ -237,6 +275,63 @@ fn decode(
         rssi,
         evidence: frame.into_evidence(),
     })
+}
+
+/// Retune the adapter on a fixed dwell.
+fn spawn_hopper(
+    cfg: WifiConfig,
+    shutdown: Arc<AtomicBool>,
+    hop_stop: Arc<AtomicBool>,
+    stats: Arc<WifiStats>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let stop = || shutdown.load(Ordering::Relaxed) || hop_stop.load(Ordering::Relaxed);
+        let mut idx = 0usize;
+        let mut failures = 0u32;
+        while !stop() {
+            let channel = cfg.channels[idx % cfg.channels.len()];
+            match set_channel(&cfg.interface, channel) {
+                Ok(()) => {
+                    failures = 0;
+                    stats.current_channel.store(channel as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    failures += 1;
+                    // A channel the regulatory domain forbids will fail every
+                    // time; complaining once per pass is enough.
+                    if failures <= cfg.channels.len() as u32 {
+                        warn!("could not set channel {channel}: {e}");
+                    }
+                }
+            }
+            idx += 1;
+            // Sleep in slices so shutdown is not delayed by a long dwell.
+            let mut remaining = cfg.dwell_ms;
+            while remaining > 0 && !stop() {
+                let slice = remaining.min(100);
+                thread::sleep(StdDuration::from_millis(slice));
+                remaining -= slice;
+            }
+        }
+    })
+}
+
+fn set_channel(interface: &str, channel: u16) -> Result<()> {
+    let out = Command::new("iw")
+        .args(["dev", interface, "set", "channel", &channel.to_string()])
+        .output()
+        .context("running `iw` - is iw installed?")?;
+    if !out.status.success() {
+        // `iw` can fail with nothing on stderr, for example while the device is
+        // being torn down. Fall back to the exit status so the log never shows
+        // an empty reason.
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            anyhow::bail!("iw exited with {}", out.status);
+        }
+        anyhow::bail!("{stderr}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

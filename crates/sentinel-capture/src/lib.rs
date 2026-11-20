@@ -7,7 +7,7 @@
 //! can be tested without a radio, and presence is left to the engine that is
 //! to consume these observations.
 //!
-//! * [`wifi`] - libpcap on a monitor-mode interface
+//! * [`wifi`] - libpcap on a monitor-mode interface, with channel hopping
 
 pub mod dot11;
 pub mod radiotap;
