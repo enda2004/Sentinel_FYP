@@ -1,4 +1,4 @@
-//! Bluetooth LE advertisements, decoded from HCI advertising reports.
+//! Passive Bluetooth LE advertisement capture.
 //!
 //! Bluetooth LE reaches people who never join the Wi-Fi: phones, watches and
 //! earbuds advertise continuously whether or not they are paired with
@@ -6,12 +6,41 @@
 //! rotate every fifteen minutes or so, which is why the advertisement
 //! *payload* rather than the address carries the identity.
 
-use sentinel_core::fingerprint::BleEvidence;
-use sentinel_core::mac::MacAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use sentinel_core::config::BleConfig;
+use sentinel_core::fingerprint::{BleEvidence, Evidence};
+use sentinel_core::mac::{MacAddr, MacKind};
+use sentinel_core::observation::Observation;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
+use tracing::{debug, info, warn};
 
 use crate::hci::{
-    EVT_LE_META, HCI_EVENT_PKT, SUBEVT_LE_ADVERTISING_REPORT, SUBEVT_LE_EXT_ADVERTISING_REPORT,
+    HciSocket, EVT_LE_META, HCI_EVENT_PKT, SUBEVT_LE_ADVERTISING_REPORT,
+    SUBEVT_LE_EXT_ADVERTISING_REPORT,
 };
+
+#[derive(Debug, Default)]
+pub struct BleStats {
+    /// LE events read from the controller. Each normally carries one
+    /// advertising report.
+    pub reports: AtomicU64,
+    /// Advertising reports decoded into observations.
+    pub parsed: AtomicU64,
+}
+
+/// Passive scan with this program's parameters. Scanning may already be
+/// enabled - by bluetoothd, by another program, or still by this one - and the
+/// controller rejects a parameter change while it is, so always stop first.
+fn start_scan(sock: &HciSocket, cfg: &BleConfig) -> Result<()> {
+    sock.set_scan_enable(false, false)?;
+    sock.set_scan_parameters(cfg.scan_interval, cfg.scan_window)?;
+    sock.set_scan_enable(true, cfg.filter_duplicates)
+}
 
 /// One decoded advertising report.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +49,66 @@ pub struct AdvReport {
     pub address_type: u8,
     pub rssi: Option<i8>,
     pub evidence: BleEvidence,
+}
+
+/// Start scanning. Blocks until `shutdown` is set.
+pub fn run(
+    cfg: BleConfig,
+    tx: Sender<Observation>,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<BleStats>,
+) -> Result<()> {
+    let sock = HciSocket::open(cfg.adapter).context("opening HCI socket")?;
+    start_scan(&sock, &cfg)?;
+
+    info!(
+        adapter = format!("hci{}", sock.device()),
+        interval_ms = cfg.scan_interval as f64 * 0.625,
+        window_ms = cfg.scan_window as f64 * 0.625,
+        "BLE passive scan running"
+    );
+
+    let mut buf = [0u8; 512];
+    'scan: while !shutdown.load(Ordering::Relaxed) {
+        // A read times out every 250 ms when the air is quiet, so the
+        // shutdown flag is checked even when nothing at all is arriving.
+        let Some(n) = sock.read_packet(&mut buf)? else {
+            continue;
+        };
+        if n == 0 {
+            continue;
+        }
+        // Command replies are read too; only LE events count.
+        if n >= 2 && buf[1] == EVT_LE_META {
+            stats.reports.fetch_add(1, Ordering::Relaxed);
+        }
+        for report in parse_event(&buf[..n]) {
+            stats.parsed.fetch_add(1, Ordering::Relaxed);
+            let obs = Observation {
+                ts: Utc::now(),
+                mac: report.address,
+                mac_kind: MacKind::classify_ble(&report.address, report.address_type),
+                rssi: report.rssi,
+                evidence: Evidence::Ble(report.evidence),
+            };
+            match tx.try_send(obs) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!("observation channel full; dropping a BLE sighting")
+                }
+                Err(TrySendError::Closed(_)) => {
+                    info!("observation receiver closed");
+                    break 'scan;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = sock.set_scan_enable(false, false) {
+        warn!("could not stop scanning cleanly: {e}");
+    }
+    info!("BLE scan stopped");
+    Ok(())
 }
 
 /// Decode an HCI event packet into zero or more advertising reports.
@@ -236,7 +325,6 @@ fn format_uuid128(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_core::mac::MacKind;
 
     fn ad(t: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![(payload.len() + 1) as u8, t];

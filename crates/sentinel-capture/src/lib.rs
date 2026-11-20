@@ -8,6 +8,7 @@
 //! to consume these observations.
 //!
 //! * [`wifi`] - libpcap on a monitor-mode interface, with channel hopping
+//! * [`ble`] - raw HCI passive scanning
 
 pub mod ble;
 pub mod dot11;
@@ -15,4 +16,5 @@ pub mod hci;
 pub mod radiotap;
 pub mod wifi;
 
+pub use ble::BleStats;
 pub use wifi::WifiStats;
