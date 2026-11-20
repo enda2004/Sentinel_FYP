@@ -16,7 +16,8 @@ pub struct Config {
 #[serde(default)]
 pub struct WifiConfig {
     pub enabled: bool,
-    /// Monitor-mode interface, e.g. `wlan1mon`.
+    /// Monitor-mode interface, e.g. `wlan1`. See `scripts/monitor-mode.sh`,
+    /// which switches an adapter to monitor mode without renaming it.
     pub interface: String,
     /// Channels to hop between. 2.4 GHz 1/6/11 plus the common 5 GHz channels.
     pub channels: Vec<u16>,
@@ -39,7 +40,7 @@ impl Default for WifiConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interface: "wlan1mon".to_string(),
+            interface: "wlan1".to_string(),
             channels: vec![1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161],
             dwell_ms: 350,
             hop: true,

@@ -6,6 +6,8 @@
 enabled = true
 # Monitor-mode interface. The built-in Raspberry Pi radio (wlan0) is usually
 # carrying the Pi's own network connection, so a second adapter is normal.
+# Put it into monitor mode first:
+# sudo ./scripts/monitor-mode.sh up wlan1
 interface = "wlan1"
 
 # Channels to hop between. One radio can only listen to one channel at a time,

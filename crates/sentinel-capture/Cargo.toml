@@ -8,3 +8,9 @@ description = "Passive 802.11 and Bluetooth LE capture"
 
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
+anyhow.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+libc.workspace = true
+pcap = "2"
