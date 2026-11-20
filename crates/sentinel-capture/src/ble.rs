@@ -8,6 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -31,6 +32,69 @@ pub struct BleStats {
     pub reports: AtomicU64,
     /// Advertising reports decoded into observations.
     pub parsed: AtomicU64,
+    /// Times the watchdog switched the scan back on after a silence.
+    pub rescans: AtomicU64,
+}
+
+/// What [`ScanWatchdog::check`] wants done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogAction {
+    Nothing,
+    /// Silent for the whole window: switch the scan back on. `first` is true
+    /// for the first time in this silence, so the log says so once rather than
+    /// once a minute for a whole empty weekday.
+    Reenable { first: bool },
+}
+
+/// Switches the scan back on in case it was switched off from outside.
+///
+/// The controller has one scan state, shared by every program on the host.
+/// Any of them can send LE Set Scan Enable = 0 - another capture program
+/// stopping, for example - and nothing tells this process: advertisements
+/// just stop.
+///
+/// A scan switched off looks exactly like a quiet house, and silence is never
+/// treated as a fault, since a house can be quiet for hours. The scan is
+/// switched back on after every window of silence for as long as it lasts,
+/// which is harmless if it was still on. Apart from shutdown or a closed
+/// channel, capture stops only on a socket error: a command that cannot be
+/// sent to the controller, or a read that fails.
+#[derive(Debug)]
+pub struct ScanWatchdog {
+    /// `None`: the watchdog is off.
+    silence: Option<Duration>,
+    last_heard: Instant,
+    reenabled: bool,
+}
+
+impl ScanWatchdog {
+    pub fn new(silence_secs: u64, now: Instant) -> ScanWatchdog {
+        ScanWatchdog {
+            silence: (silence_secs > 0).then(|| Duration::from_secs(silence_secs)),
+            last_heard: now,
+            reenabled: false,
+        }
+    }
+
+    /// An advertisement arrived. Returns true if it is the first since the
+    /// scan was re-enabled, i.e. the silence is over.
+    pub fn heard(&mut self, now: Instant) -> bool {
+        self.last_heard = now;
+        std::mem::take(&mut self.reenabled)
+    }
+
+    pub fn check(&mut self, now: Instant) -> WatchdogAction {
+        let Some(limit) = self.silence else {
+            return WatchdogAction::Nothing;
+        };
+        if now.duration_since(self.last_heard) < limit {
+            return WatchdogAction::Nothing;
+        }
+        // The re-enabled scan gets a whole window of its own.
+        let first = !std::mem::replace(&mut self.reenabled, true);
+        self.last_heard = now;
+        WatchdogAction::Reenable { first }
+    }
 }
 
 /// Passive scan with this program's parameters. Scanning may already be
@@ -68,10 +132,30 @@ pub fn run(
         "BLE passive scan running"
     );
 
+    let mut watchdog = ScanWatchdog::new(cfg.scan_silence_secs, Instant::now());
     let mut buf = [0u8; 512];
     'scan: while !shutdown.load(Ordering::Relaxed) {
-        // A read times out every 250 ms when the air is quiet, so the
-        // shutdown flag is checked even when nothing at all is arriving.
+        // A read times out every 250 ms when the air is quiet, so this runs
+        // even when nothing at all is arriving.
+        match watchdog.check(Instant::now()) {
+            WatchdogAction::Nothing => {}
+            WatchdogAction::Reenable { first } => {
+                stats.rescans.fetch_add(1, Ordering::Relaxed);
+                if first {
+                    info!(
+                        silence_secs = cfg.scan_silence_secs,
+                        "no Bluetooth advertisement for {} s; either the house is quiet or \
+                         another program switched the scan off - switching it back on, and \
+                         repeating until one arrives",
+                        cfg.scan_silence_secs
+                    );
+                } else {
+                    debug!("still no Bluetooth advertisement; switching the scan back on again");
+                }
+                start_scan(&sock, &cfg).context("re-enabling the BLE scan")?;
+            }
+        }
+
         let Some(n) = sock.read_packet(&mut buf)? else {
             continue;
         };
@@ -82,7 +166,11 @@ pub fn run(
         if n >= 2 && buf[1] == EVT_LE_META {
             stats.reports.fetch_add(1, Ordering::Relaxed);
         }
-        for report in parse_event(&buf[..n]) {
+        let reports = parse_event(&buf[..n]);
+        if !reports.is_empty() && watchdog.heard(Instant::now()) {
+            info!("Bluetooth advertisements resumed");
+        }
+        for report in reports {
             stats.parsed.fetch_add(1, Ordering::Relaxed);
             let obs = Observation {
                 ts: Utc::now(),
@@ -325,6 +413,73 @@ fn format_uuid128(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------ watchdog
+
+    /// Advertisements stop at t=0 because something switched the scan off,
+    /// and the window is 60 s. Nothing happens until a whole window has
+    /// passed; then the scan is switched back on, and again each window
+    /// after that for as long as the silence lasts.
+    #[test]
+    fn a_silent_scan_is_switched_back_on_every_window() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut w = ScanWatchdog::new(60, t0);
+
+        assert_eq!(w.check(s(59)), WatchdogAction::Nothing);
+        assert_eq!(w.check(s(60)), WatchdogAction::Reenable { first: true });
+        // The re-enabled scan gets its own full window, counted from then.
+        assert_eq!(w.check(s(90)), WatchdogAction::Nothing);
+        assert_eq!(w.check(s(119)), WatchdogAction::Nothing);
+        assert_eq!(w.check(s(120)), WatchdogAction::Reenable { first: false });
+    }
+
+    /// Nine hours with nothing on the air: the watchdog re-enables once a
+    /// minute, and that is all it does.
+    #[test]
+    fn re_enables_once_a_minute_through_a_long_silence() {
+        let t0 = Instant::now();
+        let mut w = ScanWatchdog::new(60, t0);
+
+        let actions: Vec<WatchdogAction> = (1..=9 * 3600)
+            .map(|n| w.check(t0 + Duration::from_secs(n)))
+            .filter(|a| *a != WatchdogAction::Nothing)
+            .collect();
+
+        assert_eq!(actions.len(), 9 * 60, "one per minute for nine hours");
+        assert_eq!(actions[0], WatchdogAction::Reenable { first: true });
+        assert!(
+            actions[1..].iter().all(|a| *a == WatchdogAction::Reenable { first: false }),
+            "only the first of a silence is reported as the first"
+        );
+    }
+
+    /// The next advertisement ends the silence (and says so, once), and the
+    /// watchdog is back to normal: the next silence counts as a new one.
+    #[test]
+    fn an_advertisement_after_re_enabling_resets_the_watchdog() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut w = ScanWatchdog::new(60, t0);
+
+        assert!(!w.heard(s(10)), "an ordinary advertisement is not a recovery");
+        assert_eq!(w.check(s(69)), WatchdogAction::Nothing, "the window restarts at each one");
+        assert_eq!(w.check(s(70)), WatchdogAction::Reenable { first: true });
+        assert!(w.heard(s(71)), "the first advertisement after re-enabling is the recovery");
+        assert!(!w.heard(s(72)), "and only the first");
+        assert_eq!(
+            w.check(s(132)),
+            WatchdogAction::Reenable { first: true },
+            "a fresh silence starts over"
+        );
+    }
+
+    #[test]
+    fn a_zero_window_turns_the_watchdog_off() {
+        let t0 = Instant::now();
+        let mut w = ScanWatchdog::new(0, t0);
+        assert_eq!(w.check(t0 + Duration::from_secs(86_400)), WatchdogAction::Nothing);
+    }
 
     fn ad(t: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![(payload.len() + 1) as u8, t];

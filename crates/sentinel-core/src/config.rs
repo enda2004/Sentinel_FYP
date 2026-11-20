@@ -64,6 +64,10 @@ pub struct BleConfig {
     /// Ask the controller to suppress repeat advertisements. Off by default:
     /// repeats are what show dwell time and RSSI trends.
     pub filter_duplicates: bool,
+    /// After this long with no advertisement at all, the scan is switched back
+    /// on in case another program switched it off, and again after each further
+    /// silence this long. 0 turns the watchdog off.
+    pub scan_silence_secs: u64,
 }
 
 impl Default for BleConfig {
@@ -74,6 +78,7 @@ impl Default for BleConfig {
             scan_interval: 0x0060, // 60 ms
             scan_window: 0x0060,
             filter_duplicates: false,
+            scan_silence_secs: 60,
         }
     }
 }

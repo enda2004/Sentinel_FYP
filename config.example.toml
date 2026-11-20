@@ -45,3 +45,8 @@ scan_window = 96
 # ([wifi] min_rssi).
 # Leave off: repeat advertisements are what show dwell time and RSSI trends.
 filter_duplicates = false
+# Another program on the Pi can switch the Bluetooth scan off without telling
+# Sentinel. After this many seconds with no advertisement at all, the scan is
+# switched back on, and again after each further silence this long. 0 turns
+# this off.
+scan_silence_secs = 60
