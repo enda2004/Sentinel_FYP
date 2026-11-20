@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sentinel-core",
+    "crates/sentinel-capture",
 ]
 
 [workspace.package]

@@ -1,0 +1,7 @@
+[package]
+name = "sentinel-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Passive 802.11 and Bluetooth LE capture"
